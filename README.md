@@ -1,2 +1,2 @@
-# KvpNet
+# Kvp-lsi
 The code of paper ‘’.
