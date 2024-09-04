@@ -46,7 +46,7 @@ def init_distributed_mode(args):
         backend=args.dis_backend,
         init_method=args.dis_url,
         world_size=args.world_size,
-        timeout=timedelta(seconds=7200000),
+        # timeout=timedelta(seconds=7200000),
         rank=args.rank
     )
     # 这个是：多GPU之间进行同步，也就是有的GPU跑的快，有的跑的慢（比如当你判断if RANK == 0: do something， 那么进程0就会多执行代码速度慢）
