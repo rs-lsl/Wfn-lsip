@@ -35,7 +35,7 @@ if __name__ == '__main__':
     #  --batch_size 32 --val_batch_size 32 --lr 1e-4 --test 1 --drop 0.2 --weight_decay 1 --clip_grad 5
     # setting the gpu index
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-    os.environ['NCCL_BLOCKING_WAIT'] = '0'  # not to enforce timeout
+    # os.environ['NCCL_BLOCKING_WAIT'] = '0'  # not to enforce timeout
     import torch
     torch.manual_seed(2024)
     np.random.seed(2024)
