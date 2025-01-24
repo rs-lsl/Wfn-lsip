@@ -1,7 +1,4 @@
-
 import os
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import torch
 import torch.nn as nn
@@ -18,7 +15,7 @@ import time
 import numpy as np
 from timm.scheduler import create_scheduler
 # from visualdl import LogWriter
-# from weatherbench2 import config
+from weatherbench2 import config
 import xarray as xr
 import matplotlib.pyplot as plt
 import matplotlib
@@ -26,9 +23,10 @@ import matplotlib
 import torchvision.transforms as transforms
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from metrics import metric
-
-
+from model2023.metrics import metric
+from model2023.utils.utils0 import find_min_value, find_max_value, add_diff_to_strings
+from model2023.model import SimVP_Model_x, Discriminator, AdversarialLoss
+from model2023.utils.lat_weight import get_lat_weights
 
 def init_distributed_mode(args):
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -128,6 +126,7 @@ def clip_grads(params, args, norm_type: float = 2.0):
     else:
         assert False, f"Unknown clip mode ({args.clip_mode})."
 
+
 class Pred_model(nn.Module):
     def __init__(self, model, optimizer, dataloader_train, sampler_train, dataloader_val, dataloader_test, const_data,
                  in_shape, hid_S=16, hid_T=256, N_S=4, N_T=4,
@@ -164,13 +163,16 @@ class Pred_model(nn.Module):
         log_path = os.path.join(self.results_dir, 'logs', args.ex_name)
         # self.logwriter = LogWriter(logdir=log_path)
 
+        if not args.test:
+            # self.steps_per_epoch = len(dataloader_train)
+            self.init_optim(optimizer)
+
         self.init_lat_weight()
         # self.init_model()
         # self.adv_loss = AdversarialLoss(discriminator, loss_type=loss_type)
 
     def init_lat_weight(self):
-        # modify this path
-        a_weight = np.load(os.path.join(self.args.save_dir, "little_files", "lat_weight.npy"))
+        a_weight = np.load(os.path.join(self.results_dir, 'lat_weight.npy'))
         lat_weight = torch.from_numpy(a_weight).reshape((1, 1, 1, 1, -1))#.clamp(0)
         self.lat_weight = lat_weight.type(torch.float32).to(self.device)
 
@@ -188,8 +190,168 @@ class Pred_model(nn.Module):
         # 大气变量的权重均为1，表面变量中，T2m为1，其他为0.1
         var_weight = torch.from_numpy(np.array([0.1, 0.1, 1.0, 1.0])).reshape([1,1,4,1,1]) if not self.args.pred_more else \
                             torch.from_numpy(np.array([0.1, 0.1, 1.0, 0.1, 0.1, 0.1]+[1]*(len(self.args.var_name_abb)-6))).reshape([1, 1, len(self.args.var_name_abb), 1, 1])
+        # var_weight = torch.from_numpy(np.array([0.1, 0.1,0.1, 0.1,1.0, 0.1, 0.1,0.1, 0.1,0.1, 0.1,0.1, 0.1]+[1.0]*(104-13))).reshape([1, 1, -1, 1, 1])
+        if self.args.pred_104:
+            var_weight = torch.from_numpy(np.array([0.1]*3+[1]+[0.1]*8+[1]*(len(self.args.target_dim)-12))).reshape([1, 1, len(self.args.target_dim), 1, 1])
         self.var_weight = var_weight.type(torch.float32).to(self.device)
         print(self.var_weight.flatten())
+
+        self.base_dir = 'base_dir'
+        self.mean_std = torch.from_numpy(np.load("./little_files/mean_std_2000.npy")).type(torch.float32).to(self.device).reshape([2, 1, -1, 1, 1])
+
+    def init_optim(self, optimizer):
+        # param_groups = timm.optim.optim_factory.param_groups_weight_decay(model, args.weight_decay)
+        self.optimizer = optimizer   #  torch.optim.AdamW(self.model.parameters(), lr=self.args.lr, betas=(0.9, 0.95), weight_decay=self.args.weight_decay)
+        # loss_scaler = torch.cuda.amp.GradScaler(enabled=True)
+        self.scheduler, _ = create_scheduler(self.args, self.optimizer)
+        if self.args.resume_epoch is not None:
+            self.scheduler.step(self.args.resume_epoch)
+        self.criterion = nn.L1Loss()
+        # self.criterion_latent = nn.L1Loss()
+        self.latent_weight_epoch = np.arange(0.1, 2, (2 - 0.1)/self.args.epoch)
+
+    def init_model(self):
+
+        if self.args.half_precision:
+            self.model = self.model.half()
+
+        self.checkpoint_path = os.path.join(self.cp_dir, "initial_weight.pt")
+        # print('checkpoint_path', self.checkpoint_path)
+        if self.rank == 0:
+            torch.save(self.model.state_dict(), self.cp_dir)
+        dist.barrier()
+        self.model.load_state_dict(torch.load(self.checkpoint_path, map_location=self.device))
+        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.local_rank], output_device=self.local_rank,
+                                                          find_unused_parameters=True)  # device[args.device]
+
+    def train(self):
+        # print(self.args.iter_len_epoch)
+        start_epoch = 0 if self.args.resume_epoch is None else self.args.resume_epoch
+        for epoch in range(start_epoch, self.args.epoch):
+
+            for i in range(len(self.args.iter_len_epoch) - 1):
+                if self.args.iter_len_epoch[i] <= epoch < self.args.iter_len_epoch[i + 1]:
+                    dataloader_train = self.dataloader_train[i]
+                    self.sampler_train[i].set_epoch(epoch)  # 先不加
+                    aft_seq_length = self.args.pred_len[i]
+                    break
+
+            time0 = time.time()
+            # try to return the model, optimizer, scheduler
+            loss_total = self.train_one_epoch(epoch, dataloader_train, aft_seq_length=aft_seq_length)
+
+            self.scheduler.step(epoch)
+
+            if self.rank == 0 and (epoch + 1) % self.args.save_iter == 0:
+                save_path = os.path.join(self.cp_dir, "weight_"+str(epoch+1)+".pth")
+                torch.save(self.model.module.state_dict(), save_path)
+
+            if self.rank == 0 and (epoch + 1) == self.args.epoch:
+                # print("[epoch {}] accuracy {}".format(epoch, sum_num))
+                save_path = os.path.join(self.cp_dir, "weight.pth")
+                torch.save(self.model.module.state_dict(), save_path)
+
+            if self.rank == 0 and (epoch + 1) % self.args.display_step == 0:
+                print("[epoch {}/{}] train_loss: {}, using time {}".format(epoch + 1, self.args.epoch, loss_total,
+                                                                           time.time() - time0))
+
+            dist.barrier()  # 先不加
+
+        if self.rank == 0:
+            # print("[epoch {}] accuracy {}".format(epoch, sum_num))
+            save_path = os.path.join(self.cp_dir, "weight.pth")
+            torch.save(self.model.module.state_dict(), save_path)
+
+        # if self.rank == 0:
+        #     if os.path.exists(self.checkpoint_path) is True:
+        #         os.remove(self.checkpoint_path)
+
+        cleanup()
+
+    def save_std_diff(self, mean_list1, mean_list2, mean_list4, std_list1, std_list2, std_list4):
+        if self.args.compute_std_diff:
+            std_last = []
+            for (mean_list, std_list) in [(mean_list1, std_list1), (mean_list2, std_list2), (mean_list4, std_list4)]:
+                mean_all = torch.mean(torch.cat(mean_list, 0), 0, keepdim=True)
+                std_all = torch.sqrt((torch.sum((self.bs - 1) * (torch.cat(std_list, 0) ** 2), 0)
+                                      + torch.sum(self.bs * ((torch.cat(mean_list, 0) - mean_all) ** 2), 0)) / (
+                                                 (self.bs - 1) * len(mean_list)))
+                std_last.append(std_all[None, ...])
+            print(np.array(torch.cat(std_last, 0).cpu().numpy()).shape)
+            np.save(os.path.join(self.results_dir, 'diff_std.npy'), np.array(torch.cat(std_last, 0).cpu().numpy()))
+
+        # self.mean_std = torch.from_numpy(np.load(os.path.join(self.results_dir, 'mean_std.npy'))).type(
+        #     torch.float32).to(self.device)
+
+    def train_one_epoch(self, epoch, dataloader_train, aft_seq_length=2):
+        self.model.train()
+
+        loss_total = 0.0
+        time0 = time.time()
+        # train_pbar = tqdm(dataloader_train) if rank == 0 else dataloader_train
+        for step, (images, time_data, rand_idx) in enumerate(dataloader_train):
+
+            self.optimizer.zero_grad()
+
+            inputs = (images[:, :self.args.input_time_length, ...]+ \
+                     torch.randn(size=[self.bs, self.args.input_time_length, self.ch, *self.shape_val], dtype=torch.float32)/100.0).to(self.device, non_blocking=True)
+            # inputs = inputs + ().to(self.device, non_blocking=True)
+            labels = images[:, self.args.input_time_length:(self.args.input_time_length+aft_seq_length), ...].type(torch.float32).to(self.device, non_blocking=True)
+            time_data = time_data.type(torch.float32).to(self.device, non_blocking=True)
+            with autocast():  # 混合精度训练/半精度
+
+                # time0 = time.time()
+
+                pred, pred_latent, true_latent, label_pred, embed, embed_diff, embed_label_dec\
+                    = self.model(inputs, self.const_data, time_data, labels,
+                                                                        aft_seq_length=aft_seq_length, hid_i=rand_idx[0].int(),
+                                                                        shrink=self.args.shrink, mode='train', device=self.device)  # 尝试更换latent的维度T
+
+                temp_label = labels[:, :, self.args.target_dim]
+
+                loss0 = self.time_weighted_L1_loss(pred, temp_label, latent=False, aft_seq_length=aft_seq_length)  # [:, :, self.target_dim]
+                loss1 = self.time_weighted_L1_loss(pred_latent, true_latent, latent=True,
+                                                         aft_seq_length=aft_seq_length)
+                loss2 = self.weighted_L1_loss(label_pred, images[:, :self.args.input_time_length, self.args.target_dim].to(self.device))
+                loss4 = self.weighted_L1_loss(labels[:, :, self.args.target_dim], embed_label_dec)
+                loss = loss0 + loss1 + self.args.loss_weight_in_recon * loss2 + loss4 #+ args.alpha * diff_div_reg(pred, labels)   # 维度加权损失函数
+
+            loss.backward()
+            # clip_grads(self.model.parameters(), self.args, norm_type=2.0)   #  adjust
+            self.optimizer.step()
+
+            loss_total += loss.item()
+            torch.cuda.synchronize()  # 尝试去掉
+
+        # GPU之间同步，
+        if self.device != torch.device("cpu"):
+            torch.cuda.synchronize(self.device)
+        return loss_total
+
+    def weighted_L1_loss(self, output, target):
+
+        l1_loss = F.l1_loss(output, target, reduction='none')
+        return torch.mean(l1_loss * self.lat_weight * self.var_weight)
+
+    def time_weighted_L1_loss(self, output, target, latent, input=None, aft_seq_length=2):
+        if not latent:
+            var_weight = self.var_weight
+            std_tar = torch.std(target, dim=[0,1,3,4], keepdim=True)    #    .reshape(1, 1, target.shape[2], 1, 1)
+        else:
+            var_weight = torch.ones(1).to(self.device)
+            std_tar = torch.ones(1).to(self.device)
+
+        if latent:
+            l1_loss = F.mse_loss(output, target, reduction='none')
+            return torch.mean(l1_loss * self.lat_weight * self.time_weight[:, :aft_seq_length] * var_weight / (std_tar))
+        else:
+            l1_loss = F.l1_loss(output, target, reduction='none')
+            return torch.mean(l1_loss * self.lat_weight * self.time_weight[:, :aft_seq_length] * var_weight / (std_tar))
+
+
+    def weighted_L2_loss(self, output, target):
+        l2_loss = F.mse_loss(output, target, reduction='none')
+        return torch.mean(l2_loss * self.lat_weight)
 
     def ACC(self, pred, true):
         value = torch.mean(torch.sum(pred * true * self.lat_weight, dim=(-1, -2)) / torch.sqrt(
@@ -197,8 +359,9 @@ class Pred_model(nn.Module):
         return value
 
     def test(self, mode='val'):
+        print(os.path.join(self.cp_dir, 'weight.pth'))
         state_dict = torch.load(
-            os.path.join(os.path.join(self.args.save_dir, 'weights', 'weight.pth')))
+            os.path.join(self.cp_dir, 'weight.pth'))
         if self.args.dist:
             try:
                 self.model.module.load_state_dict(state_dict)
@@ -207,9 +370,6 @@ class Pred_model(nn.Module):
         else:
             self.model.load_state_dict(state_dict)
 
-        # grad = self.evaluate_grad(
-        #     metric_list=['mae', 'rmse'], mode=mode # the validation dataset
-        # )
 
         sum_num, pred_res = self.evaluate(
             metric_list=['mae', 'rmse'], mode=mode # the validation dataset
@@ -219,11 +379,22 @@ class Pred_model(nn.Module):
         print('metrics:    ', '    mae   ', ' rmse ')  # , 'snr', 'lpips'
         print('Eval results:', sum_num)
 
-        # output_list = [torch.zeros(2)[None, ...].to(self.device) for _ in range(self.args.world_size)]
-        # dist.all_gather(output_list, torch.Tensor(sum_num)[None, ...].to(self.device))
-        # if self.rank == 0:
-        #     print(torch.mean(torch.cat(output_list), 0).cpu().numpy())
         return pred_res
+
+    def ACC2(self, pred, true):
+        pred = (pred - self.mean_std_climate) #/ torch.std(pred, [0,1,3,4], keepdim=True)
+        true = (true - self.mean_std_climate) #/ torch.std(true, [0, 1, 3, 4], keepdim=True)
+        value = torch.mean(pred * true * (self.lat_weight ** 2), dim=(0, -1, -2)) / torch.sqrt(
+            torch.mean(((pred*self.lat_weight) ** 2) ,
+                      dim=(0, -1, -2)) * torch.mean(((true*self.lat_weight) ** 2) ,dim=(0, -1, -2)))
+        return value  # time len * ch_num
+
+    def RMSE(self, pred, true, weight=None, spatial_norm=False):
+        mse = (pred - true) ** 2
+        # 使用权重进行加权
+        weighted_mse = torch.mean(mse * self.lat_weight, dim=[0, -1, -2])
+        # 计算 RMSE
+        return torch.sqrt(weighted_mse)  # time len * ch_num
 
     def evaluate(self, epoch=None, metric_list=['mae', 'mse', 'rmse', 'ssim'], mode='val'):
         if mode == 'val':
@@ -236,57 +407,53 @@ class Pred_model(nn.Module):
         spatial_norm = True
         self.model.eval()
         eval_res_list = []
+        singular_value_list = []
         # pred_res = []
         pred_res = np.empty([0, 60, 20, 64, 32])
-        label = np.empty([0, 60, 20, 64, 32])
         mean = []
         std = []
         time_list = []
-        # fuxi_path = '/data02/lisl/forcast/fuxi/2020-240x121_equiangular_with_poles_conservative.zarr'
-        # dataset = xr.open_zarr(fuxi_path, chunks=None)
-        # step_len = (dataset['10m_wind_speed'].data).shape[0]
-        # forecast_path = "/data02/lisl/forcast/ours/2020-240x121_equiangular_conservative.zarr"
 
         with torch.no_grad():
             for step, (images, time_data) in enumerate(dataloader):
                 if step % 1 == 0:
                     print(step)
                 bs_idx = step * time_data.shape[0]
-                inputs = images[:, :self.args.in_len_val, ...].type(torch.float32).to(self.device, non_blocking=True)#.clone()
-                labels = images[:, self.args.in_len_val:, ...].type(torch.float32).to(self.device, non_blocking=True)#.clone()
+                inputs = images[:, :self.args.in_len_val, ...].clone().type(torch.float32).to(self.device, non_blocking=True)#.clone()
+                labels = images[:, self.args.in_len_val:, ...].clone().type(torch.float32).to(self.device, non_blocking=True)#.clone()
                 time_data = time_data.type(torch.float32).to(self.device, non_blocking=True)
+
 
                 if self.args.half_precision:
                     inputs = inputs.half()  # .half()
                     labels = labels.half()  # .half()
-                pred, _, _, _, _, _, _ = self.model(inputs, self.const_data, time_data, labels=None,
+                time0 = time.time()
+                pred, _, _, _, _, _, _ = self.model(inputs, self.const_data, time_data, labels,
                                                     aft_seq_length=forcast_len,
                                                     shrink=self.args.shrink, mode=mode)
+
+                time_list.append((time.time() - time0))
+
                 if mode == 'test':  # and (step % 2) == 0 *************************************
                     pred_res = np.concatenate([pred_res, pred.cpu().numpy()], 0)  # = np.concatenate([pred_res, pred.cpu().numpy()], 0)
-                    label = np.concatenate([label, labels[:, :, self.args.target_dim].clone().cpu().numpy()],
-                                              0)  # = np.concatenate([pred_res, pred.cpu().numpy()], 0)
 
                 eval_res = metric(self.trans_mean_std(pred),
                                   self.trans_mean_std(labels[:, :, self.args.target_dim]),
                                   weight=self.lat_weight.cpu().numpy())
 
-                eval_res_list.append(eval_res['rmse'])
+                eval_res_list.append(torch.tensor(list(eval_res.values())))
                 if self.args.empty_cache:
                     torch.cuda.empty_cache()
 
-        eval_res_list = np.array(eval_res_list).mean(0)
-        print(eval_res_list.shape)
-        # plot the results, for example, plot the first variable U10m with index 0
-        #  args.var_name_abb = ['U10m', 'V10m', 'T2m', 'mslp', 'sp', 'TCWV', 'Z50', 'Z500', 'Z850', 'Z1000',
-        #                       'T500', 'T850', 'RH500', 'RH850', 'U500', 'U850', 'U1000', 'V500', 'V850', 'V1000']
-        plt.plot(eval_res_list[:, 0])
-        plt.xlabel('Lead time step')
-        plt.savefig(os.path.join(self.args.save_dir, 'rmse_U10m.png'), dpi=100)  # 300
-        plt.close()
-        exit()
+        print(f'In mode {mode}, inference time per 60 frames is {np.mean(np.array(time_list))}')
+        # exit()
+        eval_res_list = torch.stack(eval_res_list, 0)
+        eval_res_last = torch.mean(eval_res_list, 0)
 
-        return pred_res
+        np.set_printoptions(precision=5, suppress=True)
+        sum_num = np.array([round(i, 5) for i in eval_res_last.numpy()])
+
+        return sum_num, pred_res
 
     def trans_mean_std(self, res):
         if isinstance(res, torch.Tensor):
@@ -305,7 +472,6 @@ class Pred_model(nn.Module):
         # res = res * (self.args.min_max_array[1] - self.args.min_max_array[0]) + self.args.min_max_array[0]
 
         return res
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

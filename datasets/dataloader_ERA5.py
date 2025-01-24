@@ -1,6 +1,6 @@
 import io
-import sys
 import os
+import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -8,43 +8,12 @@ import xarray as xr
 import numpy as np
 import time
 import gc
-import h5py
+# import h5py
 import pickle
-from utils.utils import get_days_in_year, create_folder_if_not_exists, sort_by_last_digit
-from datasets.utils import create_loader
-from datasets.utils import read_img, write_img_gdal
+from utils.utils0 import get_days_in_year, create_folder_if_not_exists, sort_by_last_digit
+from datasets.utils_dataset import create_loader
+from datasets.utils_dataset import read_img, write_img_gdal
 import torchvision.transforms as trans
-
-# name: 10m_u_component_of_wind, shape (92044, 64, 32) 0
-# name: 10m_v_component_of_wind, shape (92044, 64, 32) 1
-# name: 10m_wind_speed, shape (92044, 64, 32) 2
-# name: 2m_temperature, shape (92044, 64, 32) 3
-# name: angle_of_sub_gridscale_orography, shape (64, 32)
-# name: anisotropy_of_sub_gridscale_orography, shape (64, 32)
-# name: geopotential_at_surface, shape (64, 32)
-# name: high_vegetation_cover, shape (64, 32)
-# name: lake_cover, shape (64, 32)
-# name: lake_depth, shape (64, 32)
-# name: land_sea_mask, shape (64, 32)
-# name: low_vegetation_cover, shape (64, 32)
-# name: mean_sea_level_pressure, shape (92044, 64, 32) 4
-## name: sea_ice_cover, shape (92044, 64, 32)
-## name: sea_surface_temperature, shape (92044, 64, 32)
-# name: slope_of_sub_gridscale_orography, shape (64, 32)
-# name: soil_type, shape (64, 32)
-# name: standard_deviation_of_filtered_subgrid_orography, shape (64, 32)
-# name: standard_deviation_of_orography, shape (64, 32)
-# name: surface_pressure, shape (92044, 64, 32) 5
-# name: toa_incident_solar_radiation, shape (92044, 64, 32) 6
-# name: toa_incident_solar_radiation_12hr, shape (92044, 64, 32) 7
-## name: toa_incident_solar_radiation_24hr, shape (92044, 64, 32)
-# name: toa_incident_solar_radiation_6hr, shape (92044, 64, 32) 8
-# name: total_cloud_cover, shape (92044, 64, 32) 9
-# name: total_column_water_vapour, shape (92044, 64, 32) 10
-# name: total_precipitation_12hr, shape (92044, 64, 32) 11
-## name: total_precipitation_24hr, shape (92044, 64, 32)
-# name: type_of_high_vegetation, shape (64, 32)
-# name: type_of_low_vegetation, shape (64, 32)
 
 # level, array([  50,  100,  150,  200,  250,  300,  400,  500,  600,  700,  850,  925,  1000]
 Coord_name = ['latitude', 'longitude', 'time']
@@ -60,6 +29,7 @@ var_name = ['total_precipitation_6hr', '10m_u_component_of_wind', '10m_v_compone
             'u_component_of_wind', 'v_component_of_wind', 'vertical_velocity', 'wind_speed']
             #
 ignore_name = ['sea_ice_cover', 'sea_surface_temperature', 'toa_incident_solar_radiation_24hr', 'total_precipitation_24hr']
+idx_dim = np.array([[0, 13], [5, 10], [-5, 13], [-5, 13], [-5, 13], [-5, 13], [-5, 13], [-5, 13]])  # 8*2
 train_year = [2000, 2018]
 val_year = [2018, 2020]
 test_year = [2020, 2021]
@@ -129,14 +99,9 @@ def norm_meanstd(dataset, dataset_const, dataset_time, eps=1e-9):
     return dataset, dataset_const, dataset_time
 
 def norm_meanstd2(dataset, mean_std, p_dim):
-    # num_ch = dataset.shape[1]
-    # dataset0 = np.transpose(dataset, [1,0,2,3]).reshape([num_ch, -1])
-    # mean = np.mean(dataset0, 1)#[:coor_dims]
     mean = np.reshape(mean_std[0, :], [1, -1, 1, 1])
-    # std = np.std(dataset0, 1)
     std = np.reshape(mean_std[1, :], [1, -1, 1, 1])
-    # print(dataset.shape)
-    # print(mean.shape)
+
     dataset[:, p_dim:] = (dataset[:, p_dim:] - mean) / std
 
     return dataset#, dataset_const, dataset_time
@@ -145,31 +110,88 @@ class ERA5_dataset_gdal_len1(Dataset):
     def __init__(self, main_path, seg_len, lon_len=64, lat_len=32, bs=32, list_len=8, is_training=False, ch_num_13=4,
                  idx_dim=None, input_time_length=1, in_len_val=5, mode='train'):
         super(ERA5_dataset_gdal_len1, self).__init__()
-        self.file_list = list_subdirectories(main_path)
-        self.file_list = sorted(self.file_list, key=sort_by_last_digit)
+        self.len_diff = in_len_val - input_time_length
+        self.in_len_val = in_len_val
+        if mode == 'train':
+            print(f"train dataset len is {len(list(range(0, get_days_in_year(*train_year) * 4-seg_len+1, 1)))}")
+        elif mode == 'val':
+            print(f"val dataset len is {len(list(range(0, get_days_in_year(*val_year) * 4 + self.len_diff -seg_len+1, 1)))}")
+        if mode == 'test':
+            print(f"test dataset len is {len(list(range(0, get_days_in_year(*test_year) * 4 + self.len_diff -seg_len+1, 1)))}")
+        # print(get_days_in_year(*train_year) * 4)
+        # print(4 * get_days_in_year(train_year[0], val_year[1]))
+        if mode == 'val':
+            file_list_num = np.arange(4 * get_days_in_year(train_year[0], train_year[1])-in_len_val, 4 * get_days_in_year(train_year[0], val_year[1]))
+            self.file_list = [os.path.join(main_path, str(i)) for i in file_list_num]
+        elif mode == 'test':
+            file_list_num = np.arange(4 * get_days_in_year(train_year[0], val_year[1])-in_len_val, 4 * get_days_in_year(train_year[0], test_year[1]))
+            self.file_list = [os.path.join(main_path, str(i)) for i in file_list_num]
 
+        self.file_list = sorted(self.file_list, key=sort_by_last_digit)
         self.bs, self.seg_len, self.lon_len, self.lat_len = bs, seg_len, lon_len, lat_len
+        self.ch_num = 48
         self.mode = mode
 
     def __getitem__(self, idx):
         # time0 = time.time()
         if self.mode == 'test':
             idx = idx * 2
-        a = np.array([np.load(os.path.join(self.file_list[i], 'var_data.npy')) for i in range(idx, idx+self.seg_len)])
-        # for j in range(ch_num_13):
-        #     temp_list.append(np.load(os.path.join(i, f'{j}.npy')))
-        # a = np.concatenate(temp_list, 1, dtype='float32')
-        # time_var.append(np.load(os.path.join(i, 'time_data.npy')))
-        b = np.array([np.load(os.path.join(self.file_list[i], 'time_data.npy')) for i in range(idx, idx+self.seg_len)])
-        # print(time.time()-time0)
-        # print(a.shape)
-        # print(b.shape)
+        # print(idx)
+        a = np.array([read_img(os.path.join(self.file_list[i], 'var_data.tif')) for i in range(idx, idx+self.seg_len)])
+        b = np.array([read_img(os.path.join(self.file_list[i], 'time_data.tif')) for i in range(idx, idx+self.seg_len)])
         return a, np.transpose(b.squeeze(), axes=[1,0])
 
     def __len__(self):
-        return (len(self.file_list) - self.seg_len + 1) // 2
-            # print(len(list(range(0, get_days_in_year(*test_year)*4-self.seg_len+1, 2))))
-            # return len(list(range(0, get_days_in_year(*test_year)*4-self.seg_len+1, 2)))
+        if self.mode != 'test':
+            return len(self.file_list) - self.seg_len + 1
+        else:
+            return len(list(range(0, get_days_in_year(*test_year)*4+self.in_len_val-self.seg_len+1, 2)))
+
+class ERA5_dataset_gdal_4model(Dataset):
+    def __init__(self, main_path, seg_len, lon_len=64, lat_len=32, bs=32, time_inte=None, list_len=8, is_training=False, ch_num_13=4, idx_dim=None):
+        super(ERA5_dataset_gdal_4model, self).__init__()
+        print(f"dataset len is {len(list(range(0, get_days_in_year(*train_year) * 4-seg_len+1, 1)))}")
+        # self.file_list = list_subdirectories(main_path)[:get_days_in_year(*train_year)*4]  # 26296<-->5
+        file_list_num = np.arange(get_days_in_year(*train_year)*4)
+        self.file_list = [os.path.join(main_path, str(i)) for i in file_list_num]
+        self.bs, self.seg_len, self.lon_len, self.lat_len = bs, seg_len, lon_len, lat_len
+        self.ch_num = 48
+        self.time_inte = time_inte
+        self.idx = 0
+        # print(self.file_list[:10])
+
+    def __getitem__(self, idx):
+        rand_idx = (self.idx // self.bs) % len(self.time_inte)
+        # rand_idx = np.random.randint(0, len(self.time_inte))
+        rand_inte = self.time_inte[rand_idx]
+        a = np.array([read_img(os.path.join(self.file_list[i], 'var_data.tif')) for i in range(idx, idx+self.seg_len*rand_inte, rand_inte)])
+
+        b = np.array([read_img(os.path.join(self.file_list[i], 'time_data.tif')) for i in range(idx, idx+self.seg_len*rand_inte, rand_inte)])
+
+        self.idx = self.idx + 1
+        return a, np.transpose(b.squeeze(), axes=[1,0]), rand_idx
+
+    def __len__(self):
+        # return 200
+        return len(self.file_list) - self.seg_len*max(self.time_inte) + 1
+
+def generate_days():
+    start = 1
+    step = 3
+    # 用于存储生成的字符串
+    string_list = []
+    # 循环生成字符串
+    for i in range(start, 31, step):  # 假设我们生成的数字不超过99
+        # 计算结束数字
+        end = i + step - 1
+        # 将数字格式化为两位数的字符串
+        start_str = f"{i:02d}"
+        end_str = f"{end:02d}"
+        # 将起始和结束数字合并为一个字符串，并添加到列表中
+        string_list.append(f"{start_str}_{end_str}")
+    # print(string_list)
+    string_list.append('31_31')
+    return string_list
 
 class data_prefetcher():
     def __init__(self, loader):
@@ -210,7 +232,7 @@ class data_prefetcher():
         self.preload()
         return input, input2, target
 
-def load_ERA5_dataset_per(batch_size, val_batch_size, test_batch_size, lon_len, lat_len, save_dir='/data02/lisl/ERA5', num_workers=4,
+def load_ERA5_dataset_per(batch_size, val_batch_size, test_batch_size, lon_len, lat_len, save_dir='', num_workers=4,
                            in_shape=[10, 1, 64, 64], distributed=False, use_augment=False, use_prefetcher=False, drop_last=False,
                            test=False, args=None):
     image_size = in_shape[-1] if in_shape is not None else 64
@@ -218,40 +240,6 @@ def load_ERA5_dataset_per(batch_size, val_batch_size, test_batch_size, lon_len, 
     seg_len = args.input_time_length + args.aft_seq_length_train
     if not test:
         time0 = time.time()
-
-        # # var_data_train = np.load(os.path.join(base_dir, 'datasets', 'var_data_train.npy'))
-        # # var_data_val = np.load(os.path.join(base_dir, 'datasets', 'var_data_val.npy'))
-        # # time_diff_emb_train = np.load(os.path.join(base_dir, 'datasets', 'time_diff_emb_train.npy'))
-        # # time_diff_emb_val = np.load(os.path.join(base_dir, 'datasets', 'time_diff_emb_val.npy'))
-        #
-        # seg_len = args.input_time_length + args.aft_seq_length_train
-        # file_list_train = list_subdirectories(os.path.join(save_dir, 'train'))[:get_days_in_year(2000, 2018)*4-seg_len+1]
-        # result_var = []
-        # # result_var = np.empty([args.input_time_length+args.aft_seq_length_train, 0, lon_len, lat_len])
-        # time_var = []
-        #
-        # for idx, i in enumerate(file_list_train):
-        #     if idx % 1000 == 0:
-        #         print(idx)
-        #     temp_list = [np.load(os.path.join(i, f'{j}.npy'))[:, idx_dim[j, 0]:idx_dim[j, 1]] for j in range(ch_num_13)]
-        #     # for j in range(ch_num_13):
-        #     #     temp_list.append(np.load(os.path.join(i, f'{j}.npy')))
-        #
-        #     result_var.append(np.concatenate(temp_list, 1, dtype='float32'))
-        #     time_var.append(np.load(os.path.join(i, 'time_data.npy')))
-        #     # del temp_list
-        # # print(np.asarray(result_var).shape)
-        # print(time.time()-time0)
-        # result_var = np.asarray(result_var)#.reshape([len(file_list_train), args.input_time_length+args.aft_seq_length_train, -1, lon_len, lat_len])
-        # time_var = np.asarray(time_var, dtype='float32')
-        # np.save(os.path.join(save_dir, 'var_data_train_48.npy'), result_var)
-        # np.save(os.path.join(save_dir, 'time_diff_emb_train_48.npy'), time_var)
-        # print(jj)
-        # result_var = np.load(os.path.join(save_dir, 'var_data_train_48.npy'))#[-(get_days_in_year(2010, 2018)*4-seg_len+1):]
-        # time_var = np.load(os.path.join(save_dir, 'time_diff_emb_train_48.npy'))#[-(get_days_in_year(2010, 2018)*4-seg_len+1):]
-        # result_var = np.random.random([100, 5, 48, 64, 32])  # debug
-        # time_var = np.random.random([100, 11, 5])
-        # train_set = ERA5_dataset(result_var, time_var)
 
         train_set = []
         for i in range(len(args.pred_len)):
@@ -263,192 +251,196 @@ def load_ERA5_dataset_per(batch_size, val_batch_size, test_batch_size, lon_len, 
         # gc.collect()
         print(time.time() - time0)
 
-        # file_list_train = os.path.join(save_dir, 'all_gdal_len1')
-        # result_var_val = []
-        # time_var_val = []
-        # for i in file_list_train:
-        #     temp_list = []
-        #     for j in range(ch_num_13):
-        #         temp_list.append(np.load(os.path.join(i, f'{j}.npy')))
-        #     result_var_val.append(np.asarray(temp_list).transpose(1,0,2,3,4).reshape([args.input_time_length+args.aft_seq_length_val, -1, lon_len, lat_len]))
-        #     time_var_val.append(np.load(os.path.join(i, 'time_data.npy')))
-
-        # val_set = ERA5_dataset_gdal_len1(file_list_train, seg_len=args.in_len_val+args.aft_seq_length_val,
-        #                            lon_len=64, lat_len=32, ch_num_13=ch_num_13, idx_dim=idx_dim,
-        #                                  input_time_length=args.input_time_length, in_len_val=args.in_len_val, mode='val')  # **********************  overlap_step
         dataloader_train = []
         sampler_train = []
         for i in range(len(args.pred_len)):
             dataloader_train_tmp, sampler_train_tmp = create_loader(train_set[i],
                                                             batch_size=batch_size,
                                                             shuffle=True, is_training=True,
-                                                            pin_memory=True, drop_last=True,
+                                                            pin_memory=args.pin_memory, drop_last=True,
                                                             num_workers=num_workers,
-                                                            distributed=distributed, use_prefetcher=use_prefetcher)
+                                                            distributed=distributed, use_prefetcher=use_prefetcher, return_num=3)
             dataloader_train.append(dataloader_train_tmp)
             sampler_train.append(sampler_train_tmp)
-        # dataloader_vali, _ = create_loader(val_set,
-        #                                    batch_size=val_batch_size,
-        #                                    shuffle=False, is_training=False,
-        #                                    pin_memory=True, drop_last=drop_last,
-        #                                    num_workers=num_workers,
-        #                                    distributed=distributed, use_prefetcher=use_prefetcher)
-        # del train_set, val_set
-        # print(len(dataloader_vali))
+
     elif test:
         # var_data_train, var_data_val, time_diff_emb_train, time_diff_emb_val = None, None, None, None
         dataloader_train, sampler_train, dataloader_vali = None, None, None
-    file_list_train = os.path.join(save_dir, 'data_npy')
+    file_list_train = os.path.join(save_dir, 'all_gdal_len1')
     val_set = ERA5_dataset_gdal_len1(file_list_train, seg_len=args.in_len_val + args.aft_seq_length_val,
-                                     lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13,
+                                     lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13, idx_dim=idx_dim,
                                      input_time_length=args.input_time_length, in_len_val=args.in_len_val, mode='val')
     dataloader_vali, _ = create_loader(val_set,
                                        batch_size=val_batch_size,
                                        shuffle=False, is_training=False,
-                                       pin_memory=True, drop_last=drop_last,
+                                       pin_memory=args.pin_memory, drop_last=drop_last,
                                        num_workers=num_workers,
-                                       distributed=False, use_prefetcher=False)
-    # var_data_test = np.load(os.path.join(base_dir, 'datasets', 'var_data_test.npy'))
-    # print(var_data_test.shape)
-    # var_const_data = np.load(os.path.join(base_dir, 'datasets', 'var_const_data.npy'))
+                                       distributed=False, use_prefetcher=use_prefetcher, return_num=2)
 
-    # time_diff_emb_test = np.load(os.path.join(base_dir, 'datasets', 'time_diff_emb_test.npy'))
-    # print(var_data_val[:, -1:, :, :])
-    # print('**************************')
-    # eps = 1e-9
-    # var_data_train[:, -1:, :, :] = np.log(var_data_train[:, -1:, :, :] + eps) - np.log(eps)
-    # var_data_val[:, -1:, :, :] = np.log(var_data_val[:, -1:, :, :] + eps) - np.log(eps)
-    # print(var_data_val[:, -1:, :, :])
-    # print('**************************')
-    # min_val = np.min(var_data_val[:, -1:, :, :])
-    # max_val = np.max(var_data_val[:, -1:, :, :])
-    # var_data_val[:, -1:, :, :] = (var_data_val[:, -1:, :, :] - min_val) / (max_val - min_val)
-    # print(var_data_val[:, -1:, :, :])
+    file_list_train = os.path.join(save_dir, 'all_gdal_len1')
 
-    # print(i)
-    # print(var_data_test.shape)
-    # print(var_const_data.shape)
-    # print(time_diff_emb_test.shape)
-    # result_var_test = []
-    # time_var_val = []
-    # for i in file_list_train:
-    #     temp_list = []
-    #     for j in range(ch_num_13):
-    #         temp_list.append(np.load(os.path.join(i, f'{j}.npy')))
-    #     result_var_test.append(np.asarray(temp_list).transpose(1, 0, 2, 3, 4).reshape(
-    #         [args.input_time_length + args.aft_seq_length_val, -1, lon_len, lat_len]))   # ***************************
-    #     time_var_val.append(np.load(os.path.join(i, 'time_data.npy')))
-
-    # val_set = ERA5_dataset(np.asarray(result_var_val), np.asarray(time_var_val))  # **********************  overlap_step
     test_set = ERA5_dataset_gdal_len1(file_list_train,
                                seg_len=args.in_len_val + args.aft_seq_length_test,
-                               lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13,
+                               lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13, idx_dim=idx_dim,
                                       input_time_length=args.input_time_length, in_len_val=args.in_len_val, mode='test')  # **********************  overlap_step
     # test_set = ERA5_dataset(np.asarray(result_var_test, dtype='float32'), np.asarray(time_var_val, dtype='float32'))  # **********************  overlap_step
 
     dataloader_test, _ = create_loader(test_set,
                                     batch_size=val_batch_size,
                                     shuffle=False, is_training=False,
-                                    pin_memory=True, drop_last=drop_last,
+                                    pin_memory=args.pin_memory, drop_last=drop_last,
                                     num_workers=num_workers,
-                                    distributed=False, use_prefetcher=False)  # set distributed=False to assign the value to the fuxi framework
+                                    distributed=False, use_prefetcher=use_prefetcher, return_num=2)  # set distributed=False to assign the value to the fuxi framework
     del test_set
     # print('load time: ',time.time() - time0)
 
     return dataloader_train, sampler_train, dataloader_vali, dataloader_test, #sampler_train
 
+class ERA5_dataset_1440_721_cn(Dataset):
+    def __init__(self, file_list, time_embed, seg_len, lon_len=64, lat_len=32,
+                 bs=32, time_inte=None, list_len=8, is_training=False, ch_num_13=4, var_num=7, idx_dim=None):
+        super(ERA5_dataset_1440_721_cn, self).__init__()
+        self.file_list = file_list
+        self.time_embed = time_embed
+        self.bs, self.seg_len, self.lon_len, self.lat_len = bs, seg_len, lon_len, lat_len
+        self.ch_num = 48
+        self.time_inte = time_inte
+        self.idx = 0
+        self.var_num = var_num
+
+    def __getitem__(self, idx):
+        # idx_sam = self.index_sample[idx]
+        rand_idx = (self.idx // self.bs) % len(self.time_inte)
+        rand_inte = self.time_inte[rand_idx]
+
+        # print([[self.file_list[j][i] for j in range(self.var_num)] for i in range(idx, idx+self.seg_len*rand_inte, rand_inte)])
+        data = np.array([[read_img(self.file_list[j][i]) for j in range(self.var_num-1)] for i in range(idx, idx+self.seg_len*rand_inte, rand_inte)])
+        data_surface = np.array([read_img(self.file_list[-1][i])  for i in
+                         range(idx, idx + self.seg_len * rand_inte, rand_inte)])
+
+        time_embedding = np.array(
+            [self.time_embed[i] for i in range(idx, idx + self.seg_len * rand_inte, rand_inte)])
+
+        self.idx = self.idx + 1
+        return data, data_surface, np.transpose(time_embedding, [1,0]), rand_idx
+
+    def __len__(self):
+        # return 100
+        return len(self.file_list[0]) - (self.seg_len-1) * max(self.time_inte)# + 1
+
+class ERA5_dataset_len1_1440_721_cn(Dataset):
+    def __init__(self,  file_list, time_embed, seg_len, lon_len=64,
+                 lat_len=32, bs=32, list_len=8, is_training=False, ch_num_13=4,
+                 idx_dim=None, input_time_length=1, in_len_val=5, sample_inte=4, var_num=7, mode='train'):
+        super(ERA5_dataset_len1_1440_721_cn, self).__init__()
+        self.len_diff = in_len_val - input_time_length
+        self.in_len_val = in_len_val
+        self.file_list = file_list
+        self.time_embed = time_embed
+        # print('self.file_list', self.file_list)
+
+        self.bs, self.seg_len, self.lon_len, self.lat_len = bs, seg_len, lon_len, lat_len
+        self.ch_num = 48
+        self.mode = mode
+        self.sample_inte = sample_inte
+        self.var_num = var_num
+
+    def __getitem__(self, idx):
+        idx = idx * self.sample_inte
+        data = np.array([[read_img(self.file_list[j][i]) for j in range(self.var_num-1)] for i in
+                         range(idx, idx+self.seg_len)])
+        data_surface = np.array([read_img(self.file_list[-1][i]) for i in
+                         range(idx, idx+self.seg_len)])
+        # a = np.array([[read_img(self.file_list[j][i]) for i in range(idx, idx+self.seg_len)] for j in range(self.var_num)])
+        time_embedding = np.array([self.time_embed[i] for i in range(idx, idx + self.seg_len)])
+        # print(a.shape)
+        # print(time_embedding.shape)
+        return data, data_surface, np.transpose(time_embedding, [1,0])
+
+    def __len__(self):
+        # print('len(self.file_list) // self.sample_inte', len(self.file_list) // self.sample_inte)
+        return (len(self.file_list[0]) - self.seg_len + 1 ) // self.sample_inte
+
+def load_ERA5_dataset_1440_721_cn(batch_size, val_batch_size, test_batch_size, lon_len, lat_len, era5_data_path, num_workers=4,
+                           in_shape=[10, 1, 64, 64], distributed=False, use_augment=False, use_prefetcher=False, drop_last=False,
+                           test=False, root_dir=None, args=None):
+    time_embed = np.load(os.path.join(root_dir, "era5_post/_1440_721_cn/time_diff_emb_2021_2023.npy")).transpose([1,0]) #
+
+    time_list = np.arange('2021-01-01', '2024-01-01', dtype='datetime64[1h]')
+    image_size = in_shape[-1] if in_shape is not None else 145
+    ch_num_13 = 8
+    var_name = ['q', 't', 'w', 'z', 'u', 'v', 'surface']
+
+    file_list_era5 = [[os.path.join(era5_data_path, 'era5_asia_' + var_namei + '_' + str(f) + '.tif')
+                     for f in time_list] for var_namei in var_name]
+    print('len(file_list_era5[0])', len(file_list_era5[0]))
+    print('time_embed', time_embed.shape)
+
+    trainset_num = int(len(time_list) * args.trainset_ratio)
+    file_list_train = [file_list_era50[:trainset_num] for file_list_era50 in file_list_era5]
+    file_list_test = [file_list_era50[trainset_num:] for file_list_era50 in file_list_era5]
+    print(file_list_train[0][-1])
+    print(file_list_test[0][0])
+    time_embed_train = time_embed[:trainset_num]
+    time_embed_test = time_embed[trainset_num:]
+    if not test:
+        time0 = time.time()
+
+        train_set = []
+        for i in range(len(args.pred_len)):
+            train_set.append(ERA5_dataset_1440_721_cn(file_list_train, time_embed_train,
+                                      seg_len=args.input_time_length+args.pred_len[i], lon_len=lon_len, lat_len=lat_len,
+                                             bs=args.batch_size, time_inte=args.time_inte, var_num=len(var_name)))  # **********************  overlap_step)
+
+        # del result_var, time_var
+        # gc.collect()
+        print(time.time() - time0)
+        dataloader_train = []
+        sampler_train = []
+        for i in range(len(args.pred_len)):
+            dataloader_train_tmp, sampler_train_tmp = create_loader(train_set[i],
+                                                            batch_size=batch_size,
+                                                            shuffle=True, is_training=True,
+                                                            pin_memory=args.pin_memory, drop_last=True,
+                                                            num_workers=num_workers,
+                                                            distributed=distributed, use_prefetcher=use_prefetcher
+                                                                    , return_num=4)
+            dataloader_train.append(dataloader_train_tmp)
+            sampler_train.append(sampler_train_tmp)
+
+    elif test:
+        # var_data_train, var_data_val, time_diff_emb_train, time_diff_emb_val = None, None, None, None
+        dataloader_train, sampler_train, dataloader_vali = None, None, None
+
+    val_set = ERA5_dataset_len1_1440_721_cn(file_list_test, time_embed_test,
+                                     seg_len=args.in_len_val + args.aft_seq_length_val,
+                                     lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13,
+                                     input_time_length=args.input_time_length, in_len_val=args.in_len_val,
+                                     sample_inte=args.sample_inte_test, var_num=len(var_name), mode='val')
+    dataloader_vali, _ = create_loader(val_set,
+                                       batch_size=val_batch_size,
+                                       shuffle=False, is_training=False,
+                                       pin_memory=args.pin_memory, drop_last=drop_last,
+                                       num_workers=num_workers,
+                                       distributed=False, use_prefetcher=False, return_num=3)
+
+    test_set = ERA5_dataset_len1_1440_721_cn(file_list_test, time_embed_test,
+                               seg_len=args.in_len_val + args.aft_seq_length_test,
+                               lon_len=lon_len, lat_len=lat_len, ch_num_13=ch_num_13,
+                                      input_time_length=args.input_time_length, in_len_val=args.in_len_val,
+                                      sample_inte=args.sample_inte_test, var_num=len(var_name), mode='test')  # **********************  overlap_step
+    # test_set = ERA5_dataset(np.asarray(result_var_test, dtype='float32'), np.asarray(time_var_val, dtype='float32'))  # **********************  overlap_step
+
+    dataloader_test, _ = create_loader(test_set,
+                                    batch_size=val_batch_size,
+                                    shuffle=False, is_training=False,
+                                    pin_memory=args.pin_memory, drop_last=drop_last,
+                                    num_workers=num_workers,
+                                    distributed=False, use_prefetcher=True, return_num=3)  # set distributed=False to assign the value to the fuxi framework
+    print(len(dataloader_test)) #
+    del test_set
+
+    return dataloader_train, sampler_train, dataloader_vali, dataloader_test, #sampler_train
 
 if __name__ == '__main__':
     import pandas as pd
-    dataset_dir = '/data01/lisl/era5/1959-2022-6h-64x32_equiangular_conservative.zarr'
-    dataset_dir2 = '/data01/lisl/forcast/fuxi/2020-64x32_equiangular_conservative.zarr/'
-    dataset0 = xr.open_zarr(dataset_dir)
-    for i in var_name[1:]:   # for testing ************************************************
-        data_tmp = dataset0[i].data
-        print(f'name: {i}, shape {np.array(data_tmp).shape}')
-    exit()
-    a = dataset0.sel(time=slice('1979-01-01', '2017-12-31'))
-    print(a['time'].data.shape)
-    steps_per_day = 4
-    train_days = get_days_in_year(1979, 2018) * steps_per_day
-    print(train_days)
-    # a = np.arange('2020-01-01', '2020-12-17', dtype='datetime64[12h]')
-    # b = dataset0.sel(time=slice(str(a[10]) + ':00:00.000000000', str(a[20]) + ':00:00.000000000'))
-    # str(a[10]) + ':00:00.000000000'
-    print(b['10m_u_component_of_wind'])
-    for year in range(1959, 2022):
-        timestamps = np.arange('1959-01-01', '2022-01-01', dtype='datetime64[6h]')
-        year_mask = (timestamps >= np.datetime64(f'{year}-01-01')) & (timestamps <= np.datetime64(f'{year}-12-31'))
-        year_data = np.array(dataset0['total_precipitation_6hr'])[year_mask]
-
-        # print('year: ', year)
-        print('min: ', np.min(year_data))
-        print('max: ', np.max(year_data))
-        print('mean:', np.mean(year_data))
-        index = np.where((np.abs(year_data) < 1e-6) & (np.abs(year_data) > 1e-7))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-        index = np.where((np.abs(year_data) < 1e-5) & (np.abs(year_data) > 1e-6))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-        index = np.where((np.abs(year_data) < 1e-4) & (np.abs(year_data) > 1e-5))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-        index = np.where((np.abs(year_data) < 1e-3) & (np.abs(year_data) > 1e-4))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-        index = np.where((np.abs(year_data) < 1e-2) & (np.abs(year_data) > 1e-3))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-        index = np.where((np.abs(year_data) < 1e-1) & (np.abs(year_data) > 1e-2))
-        print('ratio_0:', index[0].shape[0] / np.prod(year_data.shape))
-
-        index = np.where(year_data < 0)
-        print('ratio_nega:', index[0].shape[0] / np.prod(year_data.shape))
-
-        eps = 1e-4  # 尝试调大。如8,7,6
-        year_data = np.log(year_data + eps) - np.log(eps)
-
-        print('min_log: ', np.min(year_data))
-        print('max_log: ', np.max(year_data))
-        print('mean_log:', np.mean(year_data))
-
-    print(jj)
-    b = np.random.random((8, 400, 400))
-    t0 = time.time()
-    np.save('/data01/lisl/forcast/ours/npy.npy', b)
-    tmp = np.load('/data01/lisl/forcast/ours/npy.npy')
-    print(time.time() - t0)
-    ds = xr.Dataset(
-        data_vars={
-            "a": (("time", "longtitude", "latitude"), b),
-            # "b": ("t", np.full(8, 3), {"b atrri": "b value"}),
-        },
-        coords={
-            "longtitude": ("longtitude", np.arange(0, 400, step=1)),
-            "latitude": ("latitude", np.arange(0, 400, step=1)),
-            "time": ("time",
-                     ["2021-01-01", "2021-01-02", "2021-01-03", "2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07",
-                      "2021-01-08"])
-        }
-    )
-    print(ds)
-    # print(ds['a'].data)
-    # ds2 = xr.Dataset()
-    # # total_pre = xr.DataArray(pred_res, dims=)
-    # ds2['total_precipitation_6hr'] = np.random.random((400, 300))
-    # ds2.coords['lat'] = np.arange(0, 400, step=1)
-    # ds2.coords['lon'] = np.arange(0, 300, step=1)
-    # ds2.coords['time'] = ["2021-01-01", "2021-01-02", "2021-01-03", "2021-01-04", "2021-01-05", "2021-01-06", "2021-01-07",
-    #                   "2021-01-08"]
-    # # xr.to_zarr(ds, )
-    # print(ds2)
-    import zarr
-    t0 = time.time()
-    ds.to_zarr("/data01/lisl/forcast/ours/ds1.zarr", mode="w")
-    a = xr.open_zarr("/data01/lisl/forcast/ours/ds1.zarr")
-    b = a['a']
-    print(time.time() - t0)
-    # python weatherbench2_main/model2023/datasets/dataloader_ERA5.py
-    # dataset_dir = '/data01/lisl/forcast/hres/2016-2022-0012-64x32_equiangular_conservative.zarr/'
-    # dataset = xr.open_zarr(dataset_dir)
-    # # print(dataset.data_vars)
-    # print(np.array(dataset['time']))
-    # print(np.array(dataset['total_precipitation_6hr']).shape)
-
-    # load_ERA5_dataset(16,16,'')

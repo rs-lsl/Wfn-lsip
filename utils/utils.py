@@ -1,4 +1,3 @@
-# Copyright (c) CAIRI AI Lab. All rights reserved
 
 import cv2
 import sys

@@ -1,5 +1,3 @@
-# Copyright (c) CAIRI AI Lab. All rights reserved
-
 import argparse
 import os
 import sys

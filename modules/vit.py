@@ -1,7 +1,4 @@
 import math
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch.nn.functional as F
 import torch
@@ -146,11 +143,6 @@ class VisionTransformer(nn.Module):
         self.comm_inp_name = comm_inp_name
         self.comm_hidden_name = comm_hidden_name
 
-        self.time_conv = nn.Sequential(
-            nn.Conv3d(2, 2, [3,3,3], padding=[1,1,1], padding_mode='circular'),
-            nn.SiLU(),
-            nn.Conv3d(2, 2, [3,3,3], padding=[1,1,1], padding_mode='circular'))
-
         self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=patch_size, in_chans=inp_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
 
@@ -227,9 +219,7 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = x.view(B, 2, -1, H, W)
-        x = self.time_conv(x)
-        x = self.prepare_tokens(x.view(B, C, H, W))
+        x = self.prepare_tokens(x)
         for blk in self.blocks:
             x = blk(x)
 
